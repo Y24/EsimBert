@@ -1,94 +1,118 @@
-from model.utils import replace_masked
-from model.layers import SoftmaxAttention
-import torch
-from torch import nn
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+@file  : model.py
+@author: zijun
+@contact : zijun_sun@shannonai.com
+@date  : 2020/11/17 14:57
+@version: 1.0
+@desc  : 
+"""
 from transformers import RobertaModel
+from torch import nn
+import torch
+from scripts.train.utils import collate_to_max_length
+import sys
+sys.path.append("/home/y24/Self_Explaining_Structures_Improve_NLP_Models")
 
 
-class EsimBERT(nn.Module):
-    def __init__(self, bert_type: str = "roberta-base", num_classes=3, dropout=0.5):
-        super(EsimBERT, self).__init__()
-        print("Init EsimBert model...")
-        self.bert_hidden_sizes = {"roberta-base": 768, "roberta-large": 1024}
-        assert(bert_type in self.bert_hidden_sizes.keys())
-        self.bert_type = bert_type
-        self.hidden_size = self.bert_hidden_sizes[bert_type]
+class ExplainableModel(nn.Module):
+    def __init__(self, bert_dir, num_labels=3):
+        super().__init__()
         self.device = torch.device(
             "cuda:0" if torch.cuda.is_available() else "cpu")
-        self.num_classes = num_classes
-        self.dropout = dropout
-        self.bert_model = RobertaModel.from_pretrained(
-            bert_type, hidden_size=self.hidden_size)
-        for i in self.parameters():
-            i.requires_grad = False
-        self._attention = SoftmaxAttention()
+        self.intermediate = RobertaModel.from_pretrained(bert_dir)
+        hidden_size = self.intermediate.config.hidden_size
+        self.span_info_collect = SICModel(hidden_size)
+        self.interpretation = InterpretationModel(hidden_size)
+        self.output = nn.Linear(hidden_size, num_labels)
+    # indices indexes
 
-        self._projection = nn.Sequential(nn.Linear(4*self.hidden_size,
-                                                   self.hidden_size),
-                                         nn.ReLU())
-
-        self._classification = nn.Sequential(nn.Dropout(p=self.dropout),
-                                             nn.Linear(4*self.hidden_size,
-                                                       self.hidden_size),
-                                             nn.Tanh(),
-                                             nn.Dropout(p=self.dropout),
-                                             nn.Linear(self.hidden_size,
-                                                       self.num_classes))
-
-        print("EsimBert model is bulit!")
-
-    def forward(self,
-                premises_ids,
-                premises_mask,
-                hypotheses_ids,
-                hypotheses_mask):
-        encoded_premises = self.bert_model(
-            premises_ids, attention_mask=premises_mask)['last_hidden_state']
-        encoded_hypotheses = self.bert_model(
-            hypotheses_ids, attention_mask=hypotheses_mask)['last_hidden_state']
-        attended_premises, attended_hypotheses =\
-            self._attention(encoded_premises, premises_mask,
-                            encoded_hypotheses, hypotheses_mask)
-
-        enhanced_premises = torch.cat([encoded_premises,
-                                       attended_premises,
-                                       encoded_premises - attended_premises,
-                                       encoded_premises * attended_premises],
-                                      dim=-1)
-        enhanced_hypotheses = torch.cat([encoded_hypotheses,
-                                         attended_hypotheses,
-                                         encoded_hypotheses -
-                                         attended_hypotheses,
-                                         encoded_hypotheses *
-                                         attended_hypotheses],
-                                        dim=-1)
-
-        projected_premises = self._projection(enhanced_premises)
-        projected_hypotheses = self._projection(enhanced_hypotheses)
-
-        """ v_ai = self._composition(projected_premises, premises_mask < .5)
-        v_bj = self._composition(projected_hypotheses, hypotheses_mask < .5) """
-        v_ai = projected_premises
-        v_bj = projected_hypotheses
-        v_ai = nn.functional.softmax(v_ai, dim=-1)
-        v_bj = nn.functional.softmax(v_bj, dim=-1)
-        v_a_avg = torch.sum(v_ai * premises_mask.unsqueeze(1)
-                                                .transpose(2, 1), dim=1)\
-            / torch.sum(premises_mask, dim=1, keepdim=True)
-        v_b_avg = torch.sum(v_bj * hypotheses_mask.unsqueeze(1)
-                                                  .transpose(2, 1), dim=1)\
-            / torch.sum(hypotheses_mask, dim=1, keepdim=True)
-
-        v_a_max, _ = replace_masked(v_ai, premises_mask, -1e7).max(dim=1)
-        v_b_max, _ = replace_masked(v_bj, hypotheses_mask, -1e7).max(dim=1)
-
-        v = torch.cat([v_a_avg, v_a_max, v_b_avg, v_b_max], dim=1)
-
-        logits = self._classification(v)
-        probabilities = nn.functional.softmax(logits, dim=-1)
-
-        return logits, probabilities
+    def forward(self, input_ids, start_indexs, end_indexs, span_masks):
+        # generate mask
+        attention_mask = (input_ids != 1).long()
+        # intermediate layer
+        # output.shape = (batch_size, length, hidden_size)
+        hidden_states = self.intermediate(
+            input_ids, attention_mask=attention_mask)[0]
+        # span info collecting layer(SIC)
+        h_ij = self.span_info_collect(hidden_states, start_indexs, end_indexs)
+        # interpretation layer
+        H, a_ij = self.interpretation(h_ij, span_masks)
+        # output layer
+        out = self.output(H)
+        return out, a_ij
 
 
-if __name__ == "__main__":
-    model = EsimBERT()
+class SICModel(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.hidden_size = hidden_size
+
+        self.W_1 = nn.Linear(hidden_size, hidden_size)
+        self.W_2 = nn.Linear(hidden_size, hidden_size)
+        self.W_3 = nn.Linear(hidden_size, hidden_size)
+        self.W_4 = nn.Linear(hidden_size, hidden_size)
+
+    def forward(self, hidden_states, start_indexs, end_indexs):
+        W1_h = self.W_1(hidden_states)  # (bs, length, hidden_size)
+        W2_h = self.W_2(hidden_states)
+        W3_h = self.W_3(hidden_states)
+        W4_h = self.W_4(hidden_states)
+
+        # (bs, span_num, hidden_size)
+        W1_hi_emb = torch.index_select(W1_h, 1, start_indexs)
+        W2_hj_emb = torch.index_select(W2_h, 1, end_indexs)
+        W3_hi_start_emb = torch.index_select(W3_h, 1, start_indexs)
+        W3_hi_end_emb = torch.index_select(W3_h, 1, end_indexs)
+        W4_hj_start_emb = torch.index_select(W4_h, 1, start_indexs)
+        W4_hj_end_emb = torch.index_select(W4_h, 1, end_indexs)
+
+        # [w1*hi, w2*hj, w3(hi-hj), w4(hi⊗hj)]
+        span = W1_hi_emb + W2_hj_emb + \
+            (W3_hi_start_emb - W3_hi_end_emb) + \
+            torch.mul(W4_hj_start_emb, W4_hj_end_emb)
+        h_ij = torch.tanh(span)
+        return h_ij
+
+
+class InterpretationModel(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.h_t = nn.Linear(hidden_size, 1)
+
+    def forward(self, h_ij, span_masks):
+        o_ij = self.h_t(h_ij).squeeze(-1)  # (ba, span_num)
+        # mask illegal span
+        o_ij = o_ij - span_masks
+        # normalize all a_ij, a_ij sum = 1
+        a_ij = nn.functional.softmax(o_ij, dim=1)
+        # weight average span representation to get H
+        H = (a_ij.unsqueeze(-1) * h_ij).sum(dim=1)  # (bs, hidden_size)
+        return H, a_ij
+
+
+def main():
+    # data
+    input_id_1 = torch.LongTensor([0, 4, 5, 6, 7, 2])
+    input_id_2 = torch.LongTensor([0, 4, 5, 2])
+    input_id_3 = torch.LongTensor([0, 4, 2])
+    batch = [(input_id_1, torch.LongTensor([1]), torch.LongTensor([6])),
+             (input_id_2, torch.LongTensor([1]), torch.LongTensor([4])),
+             (input_id_3, torch.LongTensor([1]), torch.LongTensor([3]))]
+
+    output = collate_to_max_length(batch=batch, fill_values=[1, 0, 0])
+    input_ids, labels, length, start_indexs, end_indexs, span_masks = output
+
+    # model
+    #bert_path = "/data/nfsdata2/sunzijun/loop/roberta-base"
+    bert_path = "roberta-base"
+    model = ExplainableModel(bert_path)
+    print(model)
+
+    output = model(input_ids, start_indexs, end_indexs, span_masks)
+    print(output)
+
+
+if __name__ == '__main__':
+    main()

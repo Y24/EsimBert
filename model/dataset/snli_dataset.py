@@ -11,7 +11,7 @@ class SNLIDataset(Dataset):
     labels = {"contradiction": 0, 'neutral': 1, "entailment": 2}
     special_tokens = {"start": [0], "pad": [1], "end": [2]}
 
-    def __init__(self, prefix: str, directory: str = os.path.join(get_root_path(), "data/dataset/snli_1.0"), tokenizer_type: str = "roberta-base", max_length: int = 64):
+    def __init__(self, prefix: str, directory: str = os.path.join(get_root_path(), "data/dataset/snli_1.0"), tokenizer_type: str = "roberta-base", max_length: int = 512):
         super().__init__()
         print("Init SNLIDataset...")
 
@@ -32,25 +32,20 @@ class SNLIDataset(Dataset):
         return len(self.pool)
 
     def __getitem__(self, idx: int):
-        sentence1, sentence2, label = self.pool[idx]
-        if sentence1.endswith("."):
-            sentence1 = sentence1[:-1]
-        if sentence2.endswith("."):
-            sentence2 = sentence2[:-1]
-        input1_dict = self.tokenizer.encode_plus(sentence1,
-                                                 # Add '[CLS]' and '[SEP]'
-                                                 add_special_tokens=True,
-                                                 max_length=self.max_length,
-                                                 padding='max_length',
-                                                 return_attention_mask=True,
-                                                 return_tensors='pt')
-        input2_dict = self.tokenizer.encode_plus(sentence2,
-                                                 # Add '[CLS]' and '[SEP]'
-                                                 add_special_tokens=True,
-                                                 max_length=self.max_length,
-                                                 padding='max_length',
-                                                 return_attention_mask=True,
-                                                 return_tensors='pt')
-
+        premise, hypothesis, label = self.pool[idx]
+        if premise.endswith("."):
+            premise = premise[:-1]
+        if hypothesis.endswith("."):
+            hypothesis = hypothesis[:-1]
+        premise_ids = self.tokenizer.encode(
+            premise, add_special_tokens=False)
+        hypothesis_ids = self.tokenizer.encode(
+            hypothesis, add_special_tokens=False)
+        input_ids = premise_ids + [2] + hypothesis_ids
+        if len(input_ids) > self.max_length - 2:
+            input_ids = input_ids[:self.max_length - 2]
+        # convert list to tensor
+        length = torch.LongTensor([len(input_ids) + 2])
+        input_ids = torch.LongTensor([0] + input_ids + [2])
         label = torch.LongTensor([label])
-        return input1_dict['input_ids'], input2_dict['input_ids'], input1_dict['attention_mask'], input2_dict['attention_mask'], label
+        return input_ids, label, length

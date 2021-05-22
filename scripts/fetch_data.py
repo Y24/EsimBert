@@ -1,3 +1,5 @@
+import sys
+sys.path.append("/home/y24/毕设/EsimBert/")
 import os
 from util.path import get_root_path
 import wget
@@ -48,11 +50,11 @@ def fetch_data(url: str, targetdir: str, ignored: Set[Text]):
         print("Found zipped data in {} - skipping download..."
               .format(targetdir))
         unzip(filepath, igorned=ignored)
-        # os.remove(filepath)
+        os.remove(filepath)
     else:
         resultpath = download(url, targetdir)
         unzip(resultpath, igorned=ignored)
-        # os.remove(resultpath)
+        os.remove(resultpath)
 
 
 

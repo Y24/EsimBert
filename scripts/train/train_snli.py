@@ -1,21 +1,22 @@
 import sys
 sys.path.append("/home/y24/毕设/EsimBert/")
+from functools import partial
 from util.data import pack_data
 from util.path import get_root_path
 from torch.utils.data import DataLoader
 import torch
 from model.dataset.snli_dataset import SNLIDataset
-from model.esim_bert import EsimBERT
-from scripts.train.utils import train, validate
+from transformers import AdamW, get_linear_schedule_with_warmup
+from scripts.train.utils import collate_to_max_length, train, validate
 from torch import nn
 import os
+from model.esim_bert import ExplainableModel
 import argparse
 import json
 
 
 
 def main(target_dir,
-         hidden_size=768,
          dropout=0.5,
          num_classes=3,
          epochs=64,
@@ -23,20 +24,45 @@ def main(target_dir,
          lr=0.0004,
          patience=5,
          max_grad_norm=10.0,
-         checkpoint=None):
+         checkpoint=None,
+         adam_epsilon=1e-9,
+         warmup_steps=0,
+         weight_decay=0.0,
+         max_epochs=32,
+         accumulate_grad_batches=2,):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     train_loader = DataLoader(SNLIDataset(
-        "train"), shuffle=True, batch_size=batch_size)
+        "train"), shuffle=True, batch_size=batch_size, collate_fn=partial(collate_to_max_length, fill_values=[1, 0, 0]))
 
     valid_loader = DataLoader(SNLIDataset(
-        "dev"), shuffle=False, batch_size=batch_size)
-    model = EsimBERT(dropout=dropout, num_classes=num_classes).to(device)
+        "dev"), shuffle=False, batch_size=batch_size, collate_fn=partial(collate_to_max_length, fill_values=[1, 0, 0]))
+    model = ExplainableModel(
+        "roberta-base", num_labels=num_classes).to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    """  optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer,
                                                            mode="max",
                                                            factor=0.5,
-                                                           patience=0)
+                                                           patience=0) """
+    no_decay = ["bias", "LayerNorm.weight"]
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "weight_decay": weight_decay,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+        },
+    ]
+    optimizer = AdamW(optimizer_grouped_parameters,
+                      betas=(0.9, 0.98),  # according to RoBERTa paper
+                      lr=lr,
+                      eps=adam_epsilon)
+    t_total = len(train_loader) // accumulate_grad_batches * max_epochs
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps,
+                                                num_training_steps=t_total)
+
     best_score = 0.0
     start_epoch = 1
 
@@ -118,7 +144,7 @@ def main(target_dir,
                     "epochs_count": epochs_count,
                     "train_losses": train_losses,
                     "valid_losses": valid_losses},
-                   os.path.join(target_dir, "esim_bert_{}.pth.tar".format(epoch)))
+                   os.path.join(target_dir, "esim_bert_newest.pth.tar"))
 
         if patience_counter >= patience:
             print("-> Early stopping: patience limit reached, stopping...")
@@ -146,7 +172,6 @@ if __name__ == "__main__":
         config = json.load(config_file)
 
     main(os.path.join(get_root_path(), config["target_dir"]),
-         config["hidden_size"],
          config["dropout"],
          config["num_classes"],
          config["epochs"],
